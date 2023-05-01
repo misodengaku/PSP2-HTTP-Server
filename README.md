@@ -4,4 +4,4 @@ With this application, PS Vita / PS TV acts as a simple HTTP server.
 
 To quit the application please press the Start button
 
-root : ux0:www/
+root : ux0:/
