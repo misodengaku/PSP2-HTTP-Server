@@ -22,6 +22,7 @@
 #include <psp2/net/net.h>
 #include <psp2/net/netctl.h>
 
+#include <psp2/io/dirent.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
 
@@ -39,7 +40,7 @@
 
 #define printf psvDebugScreenPrintf
 
-#define BASE_PATH "host0:www"
+#define BASE_PATH "ux0:"
 
 char initparam_buf[0x4000];
 
@@ -281,31 +282,12 @@ SceKernelLwMutexWork dbg_lw_mtx;
 
 int sceNetShutdown(int s, int how);
 
-/*
-todo
 
-Connection: Keep-Alive
-Content-Length: 324664
-Content-Type: image/jpeg
-Date: Fri, 12 Jun 2020 01:23:08 GMT
-ETag: "4f438-5ca1823a:6832"
-Keep-Alive: timeout=20, max=5
-Last-modified: Mon, 01 Apr 2019 03:15:06 GMT
-*/
-
-const char resp_text[] =	"HTTP1.1 %d OK\r\n"
-				"Connection: Keep-Alive\r\n"
+const char resp_text[] =	"HTTP/1.0 %d %s\r\n"
 				"Content-Type: %s\r\n"
-				"Content-Length: %lld\r\n"
-				"Keep-Alive: timeout=20, max=5\r\n"
 				"Server: PS Vita\r\n"
 				"\r\n";
 
-const char resp_text_501[] =	"HTTP1.1 %d OK\r\n"
-				"Content-Type: %s\r\n"
-				"Content-Length: %lld\r\n"
-				"Server: PS Vita\r\n"
-				"\r\n";
 
 int http_send_thread(SceSize args, void *argp){
 
@@ -366,10 +348,13 @@ int http_send_thread(SceSize args, void *argp){
 		char file_path[0x400];
 
 		sceClibMemset(file_path, 0, sizeof(file_path));
-
+		int state_fallback_index = 0;
+		if (out_path[sceClibStrnlen(out_path, 0x1000) - 1] == '/') {
+			state_fallback_index = 1;
+		}
 		sceClibSnprintf(file_path, sizeof(file_path) - 1,
-			"%s%s%s%s",
-			BASE_PATH, (out_path[0] == '/') ? "" : "/", out_path, (out_path[sceClibStrnlen(out_path, 0x1000) - 1] == '/') ? "index.html" : ""
+			"%s%s%s",
+			BASE_PATH, (out_path[0] == '/') ? "" : "/", out_path
 		);
 
 		sceClibPrintf("[0x%08X] full : %s\n", thid, file_path);
@@ -383,16 +368,39 @@ int http_send_thread(SceSize args, void *argp){
 		SceIoStat stat;
 		sceClibMemset(&stat, 0, sizeof(stat));
 
-		fd = sceIoOpen(file_path, SCE_O_RDONLY, 0);
+		char check_file_path[0x400];
+		if (state_fallback_index == 1) {
+			sceClibSnprintf(check_file_path, sizeof(check_file_path) - 1,
+	                        "%s%s", file_path, "index.html"
+			);
+			sceClibSnprintf(content_type, sizeof(content_type) - 1,	"text/html");
+		} else {
+			sceClibMemcpy(check_file_path, file_path, (SceSize)(0x400));
+		}
+		fd = sceIoOpen(check_file_path, SCE_O_RDONLY, 0);
 		if(fd > 0){
 			Status = 200;
 			sceIoGetstatByFd(fd, &stat);
+		} else if (state_fallback_index == 1) {
+			// TODO: check directory existence
+			Status = 200;
+			state_fallback_index = 2;
 		}
 
 		sceClibPrintf("[0x%08X] sceIoOpen : 0x%X(0x%llX)\n", thid, fd, stat.st_size);
 
 		sceClibMemset(resp, 0, sizeof(resp));
-		sceClibSnprintf(resp, sizeof(resp) - 1, resp_text, Status, content_type, stat.st_size);
+
+		if (Status == 200)
+		{
+			sceClibSnprintf(resp, sizeof(resp) - 1, resp_text, 200, "OK", content_type);
+		}
+		else if (Status == 404)
+		{
+			sceClibSnprintf(resp, sizeof(resp) - 1, resp_text, 404, "Not Found", content_type);
+		} else {
+			sceClibSnprintf(resp, sizeof(resp) - 1, resp_text, 503, "Internal Server Error", content_type);
+		}
 
 		sceNetSend(wsock, resp, sceClibStrnlen(resp, 0x1000), 0);
 
@@ -441,7 +449,40 @@ int http_send_thread(SceSize args, void *argp){
 			my_free(p_send_buf);
 
 			sceClibPrintf("[0x%08X] file read end : 0x%X/0x%X/0x%X\n", thid, bytes_read, res, send_count);
-		}else{
+		}
+		else if (state_fallback_index == 2){
+			// generate directory index
+			SceUID uid = sceIoDopen(file_path);
+			SceIoDirent dirEntry;
+			if (uid == (SceUID)0) {
+				sceNetSend(wsock, "directory not found", 19, 0);
+			} else {
+				sceNetSend(wsock, "<h1>", 4, 0);
+				sceNetSend(wsock, file_path, sceClibStrnlen(file_path, 0x1000), 0);
+				sceNetSend(wsock, "</h1>\r\n", 7, 0);
+				sceNetSend(wsock, "<a href=\"../\">../</a><br>", 26, 0);
+				int result = sceIoDread(uid, &dirEntry);
+				while (result > 0){
+					SceSize dir_path_len = sceClibStrnlen(dirEntry.d_name, 0x1000);
+					sceNetSend(wsock, "<a href=\"", 9, 0);
+					sceNetSend(wsock, dirEntry.d_name, dir_path_len, 0);
+					if (SCE_S_ISDIR(dirEntry.d_stat.st_mode)) {
+						sceNetSend(wsock, "/\">", 3, 0);
+					} else {
+						sceNetSend(wsock, "\">", 2, 0);
+					}
+					sceNetSend(wsock, dirEntry.d_name, dir_path_len, 0);
+					if (SCE_S_ISDIR(dirEntry.d_stat.st_mode)) {
+						sceNetSend(wsock, "/</a><br>\r\n", 11, 0);
+					} else {
+						sceNetSend(wsock, "</a><br>\r\n", 10, 0);
+					}
+					result = sceIoDread(uid, &dirEntry);
+				}
+				sceIoDclose(uid);
+			}
+		}
+		else{
 			sceNetSend(wsock, "404 error", 9, 0);
 		}
 
@@ -452,7 +493,7 @@ int http_send_thread(SceSize args, void *argp){
 		sceClibPrintf("%s\n", http_send_param.arg);
 
 		sceClibMemset(resp, 0, sizeof(resp));
-		sceClibSnprintf(resp, sizeof(resp) - 1, resp_text_501, 501, "text/plain", 21LL);
+		sceClibSnprintf(resp, sizeof(resp) - 1, resp_text, 501, "Not Implemented", "text/plain");
 
 		sceNetSend(wsock, resp, sceClibStrnlen(resp, 0x1000), 0);
 
